@@ -1,0 +1,16 @@
+#![cfg(target_arch = "wasm32")]
+
+pub mod wasm_rln;
+pub mod wasm_utils;
+
+#[cfg(all(feature = "parallel", not(feature = "utils")))]
+pub use wasm_bindgen_rayon::init_thread_pool;
+#[cfg(not(feature = "utils"))]
+pub use wasm_rln::{WasmRLN, WasmRLNProof, WasmRLNProofValues, WasmRLNWitnessInput};
+pub use wasm_utils::{ExtendedIdentity, Hasher, Identity, VecWasmFr, WasmFr};
+
+#[cfg(feature = "panic_hook")]
+#[wasm_bindgen(js_name = initPanicHook)]
+pub fn init_panic_hook() {
+    console_error_panic_hook::set_once();
+}

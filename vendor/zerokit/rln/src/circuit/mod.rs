@@ -1,0 +1,308 @@
+// This crate provides interfaces for the zero-knowledge circuit and keys
+
+pub(crate) mod error;
+pub(crate) mod iden3calc;
+pub(crate) mod qap;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::LazyLock;
+
+use ark_bn254::{
+    Bn254, Fq as ArkFq, Fq2 as ArkFq2, Fr as ArkFr, G1Affine as ArkG1Affine,
+    G1Projective as ArkG1Projective, G2Affine as ArkG2Affine, G2Projective as ArkG2Projective,
+};
+use ark_ff::Field;
+use ark_groth16::{
+    Proof as ArkProof, ProvingKey as ArkProvingKey, VerifyingKey as ArkVerifyingKey,
+};
+use ark_relations::r1cs::ConstraintMatrices;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+
+#[cfg(not(target_arch = "wasm32"))]
+use self::error::GraphReadError;
+use self::error::ZKeyReadError;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::circuit::iden3calc::{
+    graph::Node, storage::deserialize_witnesscalc_graph, InputSignalsInfo,
+};
+use crate::partial_proof::PartialProof as ArkPartialProof;
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "multi-message-id")))]
+const GRAPH_BYTES: &[u8] = include_bytes!("../../resources/tree_depth_20/graph.bin");
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "multi-message-id"))]
+const GRAPH_BYTES: &[u8] =
+    include_bytes!("../../resources/tree_depth_20/multi_message_id/max_out_4/graph.bin");
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "multi-message-id")))]
+const ARKZKEY_BYTES: &[u8] = include_bytes!("../../resources/tree_depth_20/rln_final.arkzkey");
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "multi-message-id"))]
+const ARKZKEY_BYTES: &[u8] =
+    include_bytes!("../../resources/tree_depth_20/multi_message_id/max_out_4/rln_final.arkzkey");
+
+#[cfg(not(target_arch = "wasm32"))]
+static ARKZKEY: LazyLock<Zkey> = LazyLock::new(|| {
+    read_arkzkey_from_bytes_uncompressed(ARKZKEY_BYTES).expect("Default zkey must be valid")
+});
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "multi-message-id")))]
+static GRAPH: LazyLock<Graph> = LazyLock::new(|| {
+    graph_from_raw(GRAPH_BYTES, Some(DEFAULT_TREE_DEPTH)).expect("Default graph must be valid")
+});
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "multi-message-id"))]
+static GRAPH: LazyLock<Graph> = LazyLock::new(|| {
+    graph_from_raw(GRAPH_BYTES, Some(DEFAULT_TREE_DEPTH), Some(DEFAULT_MAX_OUT))
+        .expect("Default graph must be valid")
+});
+
+#[cfg(feature = "multi-message-id")]
+pub const DEFAULT_MAX_OUT: usize = 4;
+pub const DEFAULT_TREE_DEPTH: usize = 20;
+pub const COMPRESS_PROOF_SIZE: usize = 128;
+
+// The following types define the pairing friendly elliptic curve, the underlying finite fields and groups default to this module
+// Note that proofs are serialized assuming Fr to be 4x8 = 32 bytes in size. Hence, changing to a curve with different encoding will make proof verification to fail
+
+/// BN254 pairing-friendly elliptic curve.
+pub type Curve = Bn254;
+
+/// Scalar field Fr of the BN254 curve.
+pub type Fr = ArkFr;
+
+/// Base field Fq of the BN254 curve.
+pub type Fq = ArkFq;
+
+/// Quadratic extension field element for the BN254 curve.
+pub type Fq2 = ArkFq2;
+
+/// Affine representation of a G1 group element on the BN254 curve.
+pub type G1Affine = ArkG1Affine;
+
+/// Projective representation of a G1 group element on the BN254 curve.
+pub type G1Projective = ArkG1Projective;
+
+/// Affine representation of a G2 group element on the BN254 curve.
+pub type G2Affine = ArkG2Affine;
+
+/// Projective representation of a G2 group element on the BN254 curve.
+pub type G2Projective = ArkG2Projective;
+
+/// Groth16 proof for the BN254 curve.
+pub type Proof = ArkProof<Curve>;
+
+/// Partial Groth16 proof for the BN254 curve.
+pub type PartialProof = ArkPartialProof<Curve>;
+
+/// Proving key for the Groth16 proof system.
+pub type ProvingKey = ArkProvingKey<Curve>;
+
+/// Combining the proving key and constraint matrices.
+pub type Zkey = (ArkProvingKey<Curve>, ConstraintMatrices<Fr>);
+
+/// Verifying key for the Groth16 proof system.
+pub type VerifyingKey = ArkVerifyingKey<Curve>;
+
+/// Parsed witness calculator graph.
+///
+/// Contains the deserialized computation graph used for witness calculation.
+/// Parsing this once and reusing it avoids repeated deserialization overhead.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct Graph {
+    pub(crate) nodes: Vec<Node>,
+    pub(crate) signals: Vec<usize>,
+    pub(crate) input_mapping: InputSignalsInfo,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) tree_depth: usize,
+    #[cfg(feature = "multi-message-id")]
+    pub(crate) max_out: usize,
+}
+
+/// Loads the zkey from raw bytes
+pub fn zkey_from_raw(zkey_data: &[u8]) -> Result<Zkey, ZKeyReadError> {
+    if zkey_data.is_empty() {
+        return Err(ZKeyReadError::EmptyBytes);
+    }
+
+    let proving_key_and_matrices = read_arkzkey_from_bytes_uncompressed(zkey_data)?;
+
+    Ok(proving_key_and_matrices)
+}
+
+/// Parses the witness calculator graph from raw bytes
+#[cfg(not(target_arch = "wasm32"))]
+pub fn graph_from_raw(
+    graph_data: &[u8],
+    #[cfg(not(target_arch = "wasm32"))] expected_tree_depth: Option<usize>,
+    #[cfg(feature = "multi-message-id")] expected_max_out: Option<usize>,
+) -> Result<Graph, GraphReadError> {
+    if graph_data.is_empty() {
+        return Err(GraphReadError::EmptyBytes);
+    }
+
+    let (nodes, signals, input_mapping) =
+        deserialize_witnesscalc_graph(std::io::Cursor::new(graph_data))
+            .map_err(GraphReadError::GraphDeserialization)?;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let tree_depth = {
+        let depth = input_mapping
+            .get("pathElements")
+            .map(|(_, len)| *len)
+            .unwrap_or_default();
+
+        if let Some(expected) = expected_tree_depth {
+            if expected != depth {
+                return Err(GraphReadError::TreeDepthMismatch {
+                    expected,
+                    actual: depth,
+                });
+            }
+        }
+
+        depth
+    };
+
+    #[cfg(feature = "multi-message-id")]
+    let max_out = {
+        let count = input_mapping
+            .get("messageId")
+            .map(|(_, len)| *len)
+            .ok_or_else(|| GraphReadError::MissingSignal("messageId".into()))?;
+
+        if let Some(expected) = expected_max_out {
+            if expected != count {
+                return Err(GraphReadError::MaxOutMismatch {
+                    expected,
+                    actual: count,
+                });
+            }
+        }
+
+        count
+    };
+
+    Ok(Graph {
+        nodes,
+        signals,
+        input_mapping,
+        #[cfg(not(target_arch = "wasm32"))]
+        tree_depth,
+        #[cfg(feature = "multi-message-id")]
+        max_out,
+    })
+}
+
+// Loads default zkey from folder
+#[cfg(not(target_arch = "wasm32"))]
+pub fn zkey_from_folder() -> &'static Zkey {
+    &ARKZKEY
+}
+
+// Loads default parsed graph from folder
+#[cfg(not(target_arch = "wasm32"))]
+pub fn graph_from_folder() -> &'static Graph {
+    &GRAPH
+}
+
+// The following functions and structs are based on code from ark-zkey:
+// https://github.com/zkmopro/ark-zkey/blob/main/src/lib.rs#L106
+
+#[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug, PartialEq)]
+struct SerializableProvingKey(ArkProvingKey<Curve>);
+
+#[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug, PartialEq)]
+struct SerializableConstraintMatrices<F: Field> {
+    num_instance_variables: usize,
+    num_witness_variables: usize,
+    num_constraints: usize,
+    a_num_non_zero: usize,
+    b_num_non_zero: usize,
+    c_num_non_zero: usize,
+    a: SerializableMatrix<F>,
+    b: SerializableMatrix<F>,
+    c: SerializableMatrix<F>,
+}
+
+#[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug, PartialEq)]
+struct SerializableMatrix<F: Field> {
+    pub data: Vec<Vec<(F, usize)>>,
+}
+
+fn read_arkzkey_from_bytes_uncompressed(arkzkey_data: &[u8]) -> Result<Zkey, ZKeyReadError> {
+    if arkzkey_data.is_empty() {
+        return Err(ZKeyReadError::EmptyBytes);
+    }
+
+    let mut cursor = std::io::Cursor::new(arkzkey_data);
+
+    let serialized_proving_key =
+        SerializableProvingKey::deserialize_uncompressed_unchecked(&mut cursor)?;
+
+    let serialized_constraint_matrices =
+        SerializableConstraintMatrices::deserialize_uncompressed_unchecked(&mut cursor)?;
+
+    let proving_key: ProvingKey = serialized_proving_key.0;
+    let constraint_matrices: ConstraintMatrices<Fr> = ConstraintMatrices {
+        num_instance_variables: serialized_constraint_matrices.num_instance_variables,
+        num_witness_variables: serialized_constraint_matrices.num_witness_variables,
+        num_constraints: serialized_constraint_matrices.num_constraints,
+        a_num_non_zero: serialized_constraint_matrices.a_num_non_zero,
+        b_num_non_zero: serialized_constraint_matrices.b_num_non_zero,
+        c_num_non_zero: serialized_constraint_matrices.c_num_non_zero,
+        a: serialized_constraint_matrices.a.data,
+        b: serialized_constraint_matrices.b.data,
+        c: serialized_constraint_matrices.c.data,
+    };
+    let zkey = (proving_key, constraint_matrices);
+
+    Ok(zkey)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_empty_zkey_and_graph() {
+        let err = zkey_from_raw(&[]).unwrap_err();
+        assert!(matches!(err, ZKeyReadError::EmptyBytes));
+
+        #[cfg(not(feature = "multi-message-id"))]
+        let err = graph_from_raw(&[], None).err().unwrap();
+        #[cfg(feature = "multi-message-id")]
+        let err = graph_from_raw(&[], None, None).err().unwrap();
+        assert!(matches!(err, GraphReadError::EmptyBytes));
+
+        let err = read_arkzkey_from_bytes_uncompressed(&[]).unwrap_err();
+        assert!(matches!(err, ZKeyReadError::EmptyBytes));
+    }
+
+    #[test]
+    fn test_tree_depth_mismatch() {
+        #[cfg(not(feature = "multi-message-id"))]
+        let err = graph_from_raw(GRAPH_BYTES, Some(DEFAULT_TREE_DEPTH + 1))
+            .err()
+            .unwrap();
+        #[cfg(feature = "multi-message-id")]
+        let err = graph_from_raw(GRAPH_BYTES, Some(DEFAULT_TREE_DEPTH + 1), None)
+            .err()
+            .unwrap();
+        assert!(matches!(err, GraphReadError::TreeDepthMismatch { .. }));
+    }
+
+    #[cfg(feature = "multi-message-id")]
+    #[test]
+    fn test_max_out_mismatch() {
+        let err = graph_from_raw(
+            GRAPH_BYTES,
+            Some(DEFAULT_TREE_DEPTH),
+            Some(DEFAULT_MAX_OUT + 1),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, GraphReadError::MaxOutMismatch { .. }));
+    }
+}

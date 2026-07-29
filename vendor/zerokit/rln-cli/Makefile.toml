@@ -1,0 +1,9 @@
+[tasks.build]
+command = "cargo"
+args = ["build"]
+
+[tasks.test]
+disabled = true
+
+[tasks.bench]
+disabled = true

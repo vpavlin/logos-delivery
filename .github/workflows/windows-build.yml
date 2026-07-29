@@ -1,0 +1,141 @@
+name: ci / build-windows
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+
+env:
+  NPROC: 4
+  NIM_VERSION: '2.2.4'
+  NIMBLE_VERSION: '0.22.3'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    env:
+      MSYSTEM: MINGW64
+
+    steps:
+    - name: Configure Git to keep LF line endings
+      # Windows Git defaults to core.autocrlf=true. The LF→CRLF conversion
+      # changes the SHA1 of nimble's cloned deps, so they no longer match
+      # nimble.lock and nimble re-downloads them on every run (hanging the
+      # job). Disable autocrlf so clones match the Linux-computed checksums.
+      shell: pwsh
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.eol lf
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        update: true
+        install: >-
+          git
+          base-devel
+          mingw-w64-x86_64-toolchain
+          make
+          cmake
+          upx
+          unzip
+          mingw-w64-x86_64-rust
+          mingw-w64-x86_64-postgresql
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-gcc-libs
+          mingw-w64-x86_64-libwinpthread-git
+          mingw-w64-x86_64-zlib
+          mingw-w64-x86_64-openssl
+          mingw-w64-x86_64-python
+          mingw-w64-x86_64-cmake
+          mingw-w64-x86_64-llvm
+          mingw-w64-x86_64-clang
+          mingw-w64-x86_64-nasm
+
+    - name: Configure Git in MSYS2 to keep LF line endings
+      # The step above only configures Git for Windows. nimble clones its deps
+      # from the MSYS2 shell, whose git reads a separate global config, so the
+      # same setting must be repeated here.
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.eol lf
+
+    - name: Manually install nasm
+      run: |
+        bash scripts/install_nasm_in_windows.sh
+        source $HOME/.bashrc
+
+    - name: Add UPX to PATH
+      run: |
+        echo "/usr/bin:$PATH" >> $GITHUB_PATH
+        echo "/mingw64/bin:$PATH" >> $GITHUB_PATH
+        echo "/usr/lib:$PATH" >> $GITHUB_PATH
+        echo "/mingw64/lib:$PATH" >> $GITHUB_PATH
+
+    - name: Verify dependencies
+      run: |
+        which upx gcc g++ make cmake cargo rustc python nasm
+
+    - name: Install Nim ${{ env.NIM_VERSION }}
+      uses: jiro4989/setup-nim-action@v2
+      with:
+        nim-version: ${{ env.NIM_VERSION }}
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install Nimble ${{ env.NIMBLE_VERSION }}
+      run: |
+        export PATH="$GITHUB_WORKSPACE/.nim_runtime/bin:$PATH"
+        cd /tmp && nimble install "nimble@${{ env.NIMBLE_VERSION }}" -y
+        echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+
+    - name: Install nimble deps
+      if: steps.cache-nimbledeps.outputs.cache-hit != 'true'
+      run: |
+        export PATH="$GITHUB_WORKSPACE/.nim_runtime/bin:$HOME/.nimble/bin:$PATH"
+        # nim's source tree checks out differently per platform (its own
+        # .gitattributes forces line endings), so its locked checksum never
+        # matches on Windows — even with autocrlf disabled. --useSystemNim
+        # uses the CI-installed nim and skips that check, while still
+        # verifying every other locked dependency.
+        nimble setup --localdeps -y --useSystemNim
+        make rebuild-nat-libs-nimbledeps CC=gcc
+        make rebuild-bearssl-nimbledeps CC=gcc
+        touch nimbledeps/.nimble-setup
+
+    - name: Creating tmp directory
+      run: mkdir -p tmp
+
+    - name: Building wakunode2.exe
+      run: |
+        export PATH="$GITHUB_WORKSPACE/.nim_runtime/bin:$HOME/.nimble/bin:$PATH"
+        make wakunode2 V=3 -j${{ env.NPROC }}
+
+    - name: Building liblogosdelivery.dll
+      run: |
+        export PATH="$GITHUB_WORKSPACE/.nim_runtime/bin:$HOME/.nimble/bin:$PATH"
+        make liblogosdelivery STATIC=0 V=1 -j
+
+    - name: Check Executable
+      run: |
+        if [ -f "./build/wakunode2.exe" ]; then
+          echo "wakunode2.exe build successful"
+        else
+          echo "Build failed: wakunode2.exe not found"
+          exit 1
+        fi
+        if [ -f "./build/liblogosdelivery.dll" ]; then
+          echo "liblogosdelivery.dll build successful"
+        else
+          echo "Build failed: liblogosdelivery.dll not found"
+          exit 1
+        fi

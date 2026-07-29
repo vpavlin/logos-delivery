@@ -1,0 +1,35 @@
+[package]
+name = "rln-cli"
+version = "0.6.0"
+edition = "2021"
+
+[[example]]
+name = "relay"
+path = "src/examples/relay.rs"
+
+[[example]]
+name = "stateless"
+path = "src/examples/stateless.rs"
+required-features = ["stateless"]
+
+[[example]]
+name = "multi_message_id"
+path = "src/examples/multi_message_id.rs"
+required-features = ["multi-message-id"]
+
+[[example]]
+name = "partial"
+path = "src/examples/partial.rs"
+
+[dependencies]
+rln = { path = "../rln", version = "2.0.2", default-features = false }
+zerokit_utils = { path = "../utils", version = "1.2.0", default-features = false }
+clap = { version = "4.6.0", features = ["cargo", "derive", "env"] }
+
+[features]
+default = ["rln/pmtree-ft", "rln/parallel"]
+stateless = ["rln/stateless", "rln/parallel"]
+multi-message-id = ["rln/pmtree-ft", "rln/parallel", "rln/multi-message-id"]
+
+[package.metadata.docs.rs]
+all-features = true

@@ -1,0 +1,127 @@
+name: container-image-build
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        type: string
+        default: ${{ github.event.number }}
+    outputs:
+      image:
+        description: The resulting image link
+        value: ${{ jobs.build-docker-image.outputs.image }}
+
+env:
+  NPROC: 2
+  MAKEFLAGS: "-j${NPROC}"
+  NIMFLAGS: "--parallelBuild:${NPROC}"
+  # logos_delivery.nimble reads compile flags from NIM_PARAMS, not NIMFLAGS. Without
+  # -d:disableMarchNative here, config.nims applies -march=native and
+  # secp256k1 fails to compile.
+  NIM_PARAMS: "-d:disableMarchNative"
+  NIM_VERSION: '2.2.4'
+  NIMBLE_VERSION: '0.22.3'
+
+# This workflow should not run for outside contributors
+# If org secrets are not available, we'll avoid building and publishing the docker image and we'll pass the workflow
+jobs:
+  build-docker-image:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    name: docker-build-${{ matrix.os }}
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - name: Check secrets
+        id: secrets
+        continue-on-error: true
+        run: |
+          if [[ -z "$QUAY_PASSWORD" || -z "$QUAY_USER" ]]; then
+            echo "User does not have access to secrets, skipping workflow"
+            exit 1
+          fi
+        env:
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          QUAY_USER: ${{ secrets.QUAY_USER }}
+
+      - name: Checkout code
+        if: ${{ steps.secrets.outcome == 'success' }}
+        uses: actions/checkout@v4
+
+      - name: Install Nim ${{ env.NIM_VERSION }}
+        if: ${{ steps.secrets.outcome == 'success' }}
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ env.NIM_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Nimble ${{ env.NIMBLE_VERSION }}
+        if: ${{ steps.secrets.outcome == 'success' }}
+        run: |
+          cd /tmp && nimble install "nimble@${{ env.NIMBLE_VERSION }}" -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+
+      - name: Cache nimble deps
+        if: ${{ steps.secrets.outcome == 'success' }}
+        id: cache-nimbledeps
+        uses: actions/cache@v3
+        with:
+          path: |
+            nimbledeps/
+            nimble.paths
+          key: ${{ runner.os }}-nimbledeps-nimble${{ env.NIMBLE_VERSION }}-${{ hashFiles('nimble.lock', 'BearSSL.mk', 'Nat.mk') }}
+
+      - name: Install nimble deps
+        if: ${{ steps.secrets.outcome == 'success' && steps.cache-nimbledeps.outputs.cache-hit != 'true' }}
+        run: |
+          nimble setup --localdeps -y
+          make rebuild-nat-libs-nimbledeps
+          make rebuild-bearssl-nimbledeps
+          touch nimbledeps/.nimble-setup
+
+      - name: Build binaries
+        id: build
+        if: ${{ steps.secrets.outcome == 'success' }}
+        run: |
+          make -j${NPROC} V=1 POSTGRES=1 NIMFLAGS="-d:disableMarchNative -d:chronicles_colors:none" wakunode2 logosdeliverynode
+
+          SHORT_REF=$(git rev-parse --short HEAD)
+
+          TAG=$([ "${PR_NUMBER}" == "" ] && echo "${SHORT_REF}" || echo "${PR_NUMBER}")
+          IMAGE=quay.io/wakuorg/nwaku-pr:${TAG}
+          LD_IMAGE=quay.io/wakuorg/nwaku-pr:${TAG}-logosdeliverynode
+
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "ld_image=${LD_IMAGE}" >> $GITHUB_OUTPUT
+          echo "commit_hash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+          docker login -u ${QUAY_USER} -p ${QUAY_PASSWORD} quay.io
+          docker build -t ${IMAGE} -f docker/binaries/Dockerfile.bn.amd64 --label quay.expires-after=30d .
+          docker push ${IMAGE}
+
+          # logosdeliverynode image (same generic Dockerfile, selected via MAKE_TARGET)
+          docker build -t ${LD_IMAGE} --build-arg MAKE_TARGET=logosdeliverynode -f docker/binaries/Dockerfile.bn.amd64 --label quay.expires-after=30d .
+          docker push ${LD_IMAGE}
+        env:
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          QUAY_USER: ${{ secrets.QUAY_USER }}
+          PR_NUMBER: ${{ inputs.image_tag}}
+
+      - name: Comment PR
+        uses: thollander/actions-comment-pull-request@v2
+        if: ${{ github.event_name == 'pull_request' && steps.secrets.outcome == 'success' }}
+        with:
+          message: |
+            You can find the images built from this PR at
+
+            ```
+            ${{steps.build.outputs.image}}
+            ${{steps.build.outputs.ld_image}}
+            ```
+
+            Built from ${{ steps.build.outputs.commit_hash }}
+          comment_tag: execution-rln-v${{ matrix.rln_version }}

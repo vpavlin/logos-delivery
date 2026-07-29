@@ -1,0 +1,267 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  NPROC: 2
+  MAKEFLAGS: "-j${NPROC}"
+  NIMFLAGS: "--parallelBuild:${NPROC} --colors:off -d:chronicles_colors:none -d:disableMarchNative"
+  NIM_PARAMS: "-d:disableMarchNative"
+  NIM_VERSION: '2.2.4'
+  NIMBLE_VERSION: '0.22.3'
+
+jobs:
+  changes: # changes detection
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: read
+    steps:
+    - uses: actions/checkout@v4
+      name: Checkout code
+      id: checkout
+    - uses: dorny/paths-filter@v2
+      id: filter
+      with:
+        filters: |
+          common:
+          - '.github/workflows/**'
+          - 'nimble.lock'
+          - 'logos_delivery.nimble'
+          - 'Makefile'
+          - 'scripts/**'
+          - 'flake.nix'
+          - 'flake.lock'
+          - 'library/**'
+          v2:
+          - 'logos_delivery/**'
+          - 'apps/**'
+          - 'tools/**'
+          - 'tests/all_tests_v2.nim'
+          - 'tests/**'
+          - 'tests-e2e/**'
+          docker:
+          - 'docker/**'
+
+    outputs:
+      common: ${{ steps.filter.outputs.common }}
+      v2: ${{ steps.filter.outputs.v2 }}
+      docker: ${{ steps.filter.outputs.docker }}
+
+  build:
+    needs: changes
+    if: ${{ needs.changes.outputs.v2 == 'true' || needs.changes.outputs.common == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    name: build-${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nim ${{ env.NIM_VERSION }}
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ env.NIM_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Nimble ${{ env.NIMBLE_VERSION }}
+        run: |
+          cd /tmp && nimble install "nimble@${{ env.NIMBLE_VERSION }}" -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+
+      - name: Cache nimble deps
+        id: cache-nimbledeps
+        uses: actions/cache@v3
+        with:
+          path: |
+            nimbledeps/
+            nimble.paths
+          key: ${{ runner.os }}-nimbledeps-v2-nimble${{ env.NIMBLE_VERSION }}-${{ hashFiles('nimble.lock', 'BearSSL.mk', 'Nat.mk') }}
+
+      - name: Install nimble deps
+        if: steps.cache-nimbledeps.outputs.cache-hit != 'true'
+        run: |
+          # nim's source tree checksums differently across platforms, so its
+          # locked checksum is unreliable. --useSystemNim uses the CI nim and
+          # skips that check, while still verifying every other locked dep.
+          nimble setup --localdeps -y --useSystemNim
+          make rebuild-nat-libs-nimbledeps
+          make rebuild-bearssl-nimbledeps
+          touch nimbledeps/.nimble-setup
+
+      - name: Build binaries
+        # -j1: `all` builds wakunode2 and liblogosdelivery, each via `nimble
+        # <task>`. Under -j2 the two nimble invocations re-resolve git deps
+        # concurrently and clobber each other in the shared ~/.nimble/pkgcache
+        # (e.g. "destination already exists", "could not lock config file"),
+        # failing the build. Serializing the targets removes the race; Nim's
+        # own --parallelBuild still parallelizes compilation. Mirrors the test
+        # job, which already forces -j1.
+        run: make V=1 -j1 all
+
+      # Publish the freshly built shared library so the interop-tests workflow
+      # can run the wrapper suite against it without rebuilding. Only the Linux
+      # build is uploaded since the interop runners are ubuntu-latest.
+      - name: Upload liblogosdelivery.so
+        if: matrix.os == 'ubuntu-22.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: liblogosdelivery
+          path: build/liblogosdelivery.so
+          retention-days: 1
+
+  build-windows:
+    needs: changes
+    if: ${{ needs.changes.outputs.v2 == 'true' || needs.changes.outputs.common == 'true' }}
+    uses: ./.github/workflows/windows-build.yml
+    with:
+      branch: ${{ github.ref }}
+
+  test:
+    needs: changes
+    if: ${{ needs.changes.outputs.v2 == 'true' || needs.changes.outputs.common == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    name: test-${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nim ${{ env.NIM_VERSION }}
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ env.NIM_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Nimble ${{ env.NIMBLE_VERSION }}
+        run: |
+          cd /tmp && nimble install "nimble@${{ env.NIMBLE_VERSION }}" -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+
+      - name: Cache nimble deps
+        id: cache-nimbledeps
+        uses: actions/cache@v3
+        with:
+          path: |
+            nimbledeps/
+            nimble.paths
+          key: ${{ runner.os }}-nimbledeps-v2-nimble${{ env.NIMBLE_VERSION }}-${{ hashFiles('nimble.lock', 'BearSSL.mk', 'Nat.mk') }}
+
+      - name: Install nimble deps
+        if: steps.cache-nimbledeps.outputs.cache-hit != 'true'
+        run: |
+          # nim's source tree checksums differently across platforms, so its
+          # locked checksum is unreliable. --useSystemNim uses the CI nim and
+          # skips that check, while still verifying every other locked dep.
+          nimble setup --localdeps -y --useSystemNim
+          make rebuild-nat-libs-nimbledeps
+          make rebuild-bearssl-nimbledeps
+          touch nimbledeps/.nimble-setup
+
+      - name: Run tests
+        run: |
+          postgres_enabled=0
+          if [ ${{ runner.os }} == "Linux" ]; then
+            sudo docker run --rm -d -e POSTGRES_PASSWORD=test123 -p 5432:5432 postgres:15.4-alpine3.18
+            postgres_enabled=1
+          fi
+
+          export MAKEFLAGS="-j1"
+          export NIMFLAGS="--colors:off -d:chronicles_colors:none -d:disableMarchNative"
+          export USE_LIBBACKTRACE=0
+
+          make V=1 POSTGRES=$postgres_enabled test
+          make V=1 POSTGRES=$postgres_enabled testwakunode2
+
+  build-docker-image:
+    needs: changes
+    if: ${{ needs.changes.outputs.v2 == 'true' || needs.changes.outputs.common == 'true' || needs.changes.outputs.docker == 'true' }}
+    uses: ./.github/workflows/container-image.yml
+    secrets: inherit
+
+  # Docker-based interop smoke tests. Gated only on the docker image so they
+  # still run on docker-only PRs (no liblogosdelivery build required).
+  nwaku-nwaku-interop-tests:
+    needs: build-docker-image
+    uses: logos-messaging/logos-delivery-interop-tests/.github/workflows/nim_waku_PR.yml@SMOKE_TEST_2026.06.25
+    with:
+      node_nwaku: ${{ needs.build-docker-image.outputs.image }}
+
+    secrets: inherit
+
+  # Send API E2E tests run the in-repo tests-e2e/ wrapper suite against the
+  # liblogosdelivery.so built by the `build` job (downloaded as the
+  # `liblogosdelivery` artifact). Gated on `build`, so it is skipped on
+  # docker-only PRs where no lib is built.
+  send-api-e2e-tests:
+    needs: build
+    uses: ./.github/workflows/e2e-api-tests.yml
+    secrets: inherit
+
+  lint:
+    name: "Lint"
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nim ${{ env.NIM_VERSION }}
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ env.NIM_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Nimble ${{ env.NIMBLE_VERSION }}
+        run: |
+          cd /tmp && nimble install "nimble@${{ env.NIMBLE_VERSION }}" -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+
+      - name: Cache nimble deps
+        id: cache-nimbledeps
+        uses: actions/cache@v3
+        with:
+          path: |
+            nimbledeps/
+            nimble.paths
+          key: ${{ runner.os }}-nimbledeps-v2-nimble${{ env.NIMBLE_VERSION }}-${{ hashFiles('nimble.lock', 'BearSSL.mk', 'Nat.mk') }}
+
+      - name: Install nimble deps
+        if: steps.cache-nimbledeps.outputs.cache-hit != 'true'
+        run: |
+          # nim's source tree checksums differently across platforms, so its
+          # locked checksum is unreliable. --useSystemNim uses the CI nim and
+          # skips that check, while still verifying every other locked dep.
+          nimble setup --localdeps -y --useSystemNim
+          make rebuild-nat-libs-nimbledeps
+          make rebuild-bearssl-nimbledeps
+          touch nimbledeps/.nimble-setup
+
+      - name: Build nph
+        run: |
+          make build-nph
+
+      - name: Check nph formatting
+        run: |
+          shopt -s extglob  # Enable extended globbing
+          NPH=$(make print-nph-path)
+          echo "using nph at ${NPH}"
+          "${NPH}" examples logos_delivery tests tools apps *.@(nim|nims|nimble)
+          git diff --exit-code

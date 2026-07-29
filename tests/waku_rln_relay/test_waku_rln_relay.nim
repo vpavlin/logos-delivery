@@ -1,0 +1,506 @@
+{.used.}
+
+import
+  results,
+  std/[os, sequtils, tempfiles, strutils, osproc, algorithm],
+  stew/byteutils,
+  testutils/unittests,
+  chronos,
+  chronicles,
+  stint,
+  libp2p/crypto/crypto
+
+import brokers/broker_context
+
+import
+  logos_delivery/waku/
+    [waku_core, rln, rln/bindings, rln/protocol_metrics, waku_keystore],
+  ./rln/waku_rln_relay_utils,
+  ./utils_onchain,
+  ../testlib/[wakucore, futures, wakunode, testutils]
+
+from std/times import epochTime
+
+suite "Waku rln relay":
+  var anvilProc {.threadVar.}: Process
+  var manager {.threadVar.}: OnchainGroupManager
+
+  setup:
+    anvilProc = runAnvil(stateFile = Opt.some(DEFAULT_ANVIL_STATE_PATH))
+    manager = waitFor setupOnchainGroupManager(deployContracts = false)
+
+  teardown:
+    stopAnvil(anvilProc)
+
+  test "ffi_extended_key_gen raw FFI":
+    # When we call the raw key-generation FFI
+    var vec = ffi_extended_key_gen()
+
+    # Then it returns exactly 4 field elements
+    # (idTrapdoor, idNullifier, idSecretHash, idCommitment — each 32 bytes)
+    defer:
+      ffi_vec_cfr_free(vec)
+    check:
+      int(ffi_vec_cfr_len(addr vec)) == 4
+
+  test "membership Key Generation":
+    let idCredentialsRes = membershipKeyGen()
+    require:
+      idCredentialsRes.isOk()
+
+    let idCredential = idCredentialsRes.get()
+    let empty = default(array[32, byte])
+    check:
+      idCredential.idTrapdoor.len == 32
+      idCredential.idNullifier.len == 32
+      idCredential.idSecretHash.len == 32
+      idCredential.idCommitment.len == 32
+      idCredential.idTrapdoor != empty
+      idCredential.idNullifier != empty
+      idCredential.idSecretHash != empty
+      idCredential.idCommitment != empty
+
+    info "the generated identity credential: ", idCredential
+
+  test "poseidon hash utils":
+    # create an RLN instance
+    let rlnInstance = createRLNInstanceWrapper()
+    require:
+      rlnInstance.isOk()
+    let rln = rlnInstance.get()
+
+    # prepare the input — hex-decoded then reversed to little-endian field elements
+    let
+      left = hexToSeqByte(
+          "126f4c026cd731979365f79bd345a46d673c5a3f6f588bdc718e6356d02b6fdc"
+        )
+        .reversed()
+      right = hexToSeqByte(
+          "1f0e5db2b69d599166ab16219a97b82b662085c93220382b39f9f911d3b943b1"
+        )
+        .reversed()
+
+    let hashRes = poseidon(left, right)
+
+    check:
+      hashRes.isOk()
+      "180543bc9afb81d9c2282df9c9946f87b4596cf6d3fec2cc32b6637427685353" ==
+        hashRes.get().inHex()
+
+  test "RateLimitProof Protobuf encode/init test":
+    var
+      proof: ZKSNARK
+      merkleRoot: MerkleNode
+      epoch: Epoch
+      shareX: MerkleNode
+      shareY: MerkleNode
+      nullifier: Nullifier
+      rlnIdentifier: RlnIdentifier
+
+    # populate fields with dummy values
+    for x in proof.mitems:
+      x = 1
+    for x in merkleRoot.mitems:
+      x = 2
+    for x in epoch.mitems:
+      x = 3
+    for x in shareX.mitems:
+      x = 4
+    for x in shareY.mitems:
+      x = 5
+    for x in nullifier.mitems:
+      x = 6
+    for x in rlnIdentifier.mitems:
+      x = 7
+
+    let
+      rateLimitProof = RateLimitProof(
+        proof: proof,
+        merkleRoot: merkleRoot,
+        epoch: epoch,
+        shareX: shareX,
+        shareY: shareY,
+        nullifier: nullifier,
+        rlnIdentifier: rlnIdentifier,
+      )
+      protobuf = rateLimitProof.encode()
+      decodednsp = RateLimitProof.init(protobuf.buffer)
+
+    require:
+      decodednsp.isOk()
+    check:
+      decodednsp.value == rateLimitProof
+
+  test "toEpoch and fromEpoch consistency check":
+    # check edge cases
+    let
+      epoch = uint64.high # rln epoch
+      epochBytes = epoch.toEpoch()
+      decodedEpoch = epochBytes.fromEpoch()
+    check:
+      epoch == decodedEpoch
+    info "encoded and decode time",
+      epoch = epoch, epochBytes = epochBytes, decodedEpoch = decodedEpoch
+
+  test "Epoch comparison, epoch1 > epoch2":
+    # check edge cases
+    let
+      time1 = uint64.high
+      time2 = uint64.high - 1
+      epoch1 = time1.toEpoch()
+      epoch2 = time2.toEpoch()
+    check:
+      absDiff(epoch1, epoch2) == uint64(1)
+      absDiff(epoch2, epoch1) == uint64(1)
+
+  test "updateLog and hasDuplicate tests":
+    let
+      rln = Rln()
+      epoch = rln.getCurrentEpoch()
+
+    #  create some dummy nullifiers and secret shares
+    var nullifier1: Nullifier
+    for index, x in nullifier1.mpairs:
+      nullifier1[index] = 1
+    var shareX1: MerkleNode
+    for index, x in shareX1.mpairs:
+      shareX1[index] = 1
+    let shareY1 = shareX1
+
+    var nullifier2: Nullifier
+    for index, x in nullifier2.mpairs:
+      nullifier2[index] = 2
+    var shareX2: MerkleNode
+    for index, x in shareX2.mpairs:
+      shareX2[index] = 2
+    let shareY2 = shareX2
+
+    let nullifier3 = nullifier1
+    var shareX3: MerkleNode
+    for index, x in shareX3.mpairs:
+      shareX3[index] = 3
+    let shareY3 = shareX3
+
+    proc encodeAndGetBuf(proof: RateLimitProof): seq[byte] =
+      return proof.encode().buffer
+
+    let
+      proof1 = RateLimitProof(
+        epoch: epoch, nullifier: nullifier1, shareX: shareX1, shareY: shareY1
+      )
+      wm1 = WakuMessage(proof: proof1.encodeAndGetBuf())
+      proof2 = RateLimitProof(
+        epoch: epoch, nullifier: nullifier2, shareX: shareX2, shareY: shareY2
+      )
+      wm2 = WakuMessage(proof: proof2.encodeAndGetBuf())
+      proof3 = RateLimitProof(
+        epoch: epoch, nullifier: nullifier3, shareX: shareX3, shareY: shareY3
+      )
+      wm3 = WakuMessage(proof: proof3.encodeAndGetBuf())
+
+    # check whether hasDuplicate correctly finds records with the same nullifiers but different secret shares
+    # no duplicate for proof1 should be found, since the log is empty
+    let proofMetadata1 = proof1.extractMetadata().tryGet()
+    let isDuplicate1 = rln.hasDuplicate(epoch, proofMetadata1).valueOr:
+      raiseAssert $error
+    assert isDuplicate1 == false, "no duplicate should be found"
+    #  add it to the log
+    discard rln.updateLog(epoch, proofMetadata1)
+
+    # no duplicate for proof2 should be found, its nullifier differs from proof1
+    let proofMetadata2 = proof2.extractMetadata().tryGet()
+    let isDuplicate2 = rln.hasDuplicate(epoch, proofMetadata2).valueOr:
+      raiseAssert $error
+    # no duplicate is found
+    assert isDuplicate2 == false, "no duplicate should be found"
+    #  add it to the log
+    discard rln.updateLog(epoch, proofMetadata2)
+
+    #  proof3 has the same nullifier as proof1 but different secret shares, it should be detected as duplicate
+    let isDuplicate3 = rln.hasDuplicate(epoch, proof3.extractMetadata().tryGet()).valueOr:
+      raiseAssert $error
+    # it is a duplicate
+    assert isDuplicate3, "duplicate should be found"
+
+  asyncTest "validateMessageAndUpdateLog: against epoch gap":
+    let index = MembershipIndex(5)
+
+    let wakuRlnConfig = getWakuRlnConfig(manager = manager, index = index)
+    var rln: Rln
+    lockNewGlobalBrokerContext:
+      rln = (await Rln.new(wakuRlnConfig)).valueOr:
+        raiseAssert $error
+
+    let manager = cast[OnchainGroupManager](rln.groupManager)
+    let idCredentials = generateCredentials()
+
+    (waitFor manager.register(idCredentials, UserMessageLimit(20))).isOkOr:
+      assert false, "error returned when calling register: " & error
+
+    let epoch1 = rln.getCurrentEpoch()
+
+    # Create messages from the same peer and append RLN proof to them (except wm4)
+    var
+      wm1 = WakuMessage(payload: "Valid message".toBytes(), timestamp: now())
+      # Another message in the same epoch as wm1, expected to break the rate limit
+      wm2 = WakuMessage(payload: "Spam message".toBytes(), timestamp: now())
+
+    await sleepAsync(1.seconds)
+    let epoch2 = rln.getCurrentEpoch()
+
+    var
+      # wm3 points to the next epoch due to the sleep
+      wm3 = WakuMessage(payload: "Valid message".toBytes(), timestamp: now())
+      wm4 = WakuMessage(payload: "Invalid message".toBytes(), timestamp: now())
+
+    # Append RLN proofs
+    rln.unsafeAppendRLNProof(wm1, epoch1, MessageId(1)).isOkOr:
+      raiseAssert $error
+    rln.unsafeAppendRLNProof(wm2, epoch1, MessageId(1)).isOkOr:
+      raiseAssert $error
+    rln.unsafeAppendRLNProof(wm3, epoch2, MessageId(3)).isOkOr:
+      raiseAssert $error
+
+    # Validate messages
+    let
+      msgValidate1 = await rln.validateMessageAndUpdateLog(wm1)
+      # wm2 is within the same epoch as wm1 → should be spam
+      msgValidate2 = await rln.validateMessageAndUpdateLog(wm2)
+      # wm3 is in the next epoch → should be valid
+      msgValidate3 = await rln.validateMessageAndUpdateLog(wm3)
+      # wm4 has no RLN proof → should be invalid
+      msgValidate4 = await rln.validateMessageAndUpdateLog(wm4)
+
+    check:
+      msgValidate1 == MessageValidationResult.Valid
+      msgValidate2 == MessageValidationResult.Spam
+      msgValidate3 == MessageValidationResult.Valid
+      msgValidate4 == MessageValidationResult.Invalid
+
+  asyncTest "validateMessageAndUpdateLog: against timestamp gap":
+    let index = MembershipIndex(5)
+
+    let wakuRlnConfig = getWakuRlnConfig(manager = manager, index = index)
+
+    var rln: Rln
+    lockNewGlobalBrokerContext:
+      rln = (await Rln.new(wakuRlnConfig)).valueOr:
+        raiseAssert $error
+
+    let manager = cast[OnchainGroupManager](rln.groupManager)
+    let idCredentials = generateCredentials()
+
+    (waitFor manager.register(idCredentials, UserMessageLimit(20))).isOkOr:
+      assert false, "error returned when calling register: " & error
+
+    # usually it's 20 seconds but we set it to 1 for testing purposes which make the test faster
+    rln.rlnMaxTimestampGap = 1
+
+    var epoch = rln.getCurrentEpoch()
+
+    var
+      wm1 = WakuMessage(
+        payload: "timestamp message".toBytes(),
+        contentTopic: DefaultPubsubTopic,
+        timestamp: now(),
+      )
+      wm2 = WakuMessage(
+        payload: "timestamp message".toBytes(),
+        contentTopic: DefaultPubsubTopic,
+        timestamp: now(),
+      )
+
+    rln.unsafeAppendRLNProof(wm1, epoch, MessageId(1)).isOkOr:
+      raiseAssert $error
+
+    rln.unsafeAppendRLNProof(wm2, epoch, MessageId(2)).isOkOr:
+      raiseAssert $error
+
+    # validate the first message because it's timestamp is the same as the generated timestamp
+    let msgValidate1 = await rln.validateMessageAndUpdateLog(wm1)
+
+    # wait for 2 seconds to make the timestamp different from generated timestamp
+    await sleepAsync(2.seconds)
+
+    let msgValidate2 = await rln.validateMessageAndUpdateLog(wm2)
+
+    check:
+      msgValidate1 == MessageValidationResult.Valid
+      msgValidate2 == MessageValidationResult.Invalid
+
+  asyncTest "multiple senders with same external nullifier":
+    let index1 = MembershipIndex(5)
+    let rlnConf1 = getWakuRlnConfig(manager = manager, index = index1)
+    var wakuRlnRelay1: Rln
+    lockNewGlobalBrokerContext:
+      wakuRlnRelay1 = (await Rln.new(rlnConf1)).valueOr:
+        raiseAssert "failed to create waku rln relay: " & $error
+
+    let manager1 = cast[OnchainGroupManager](wakuRlnRelay1.groupManager)
+    let idCredentials1 = generateCredentials()
+
+    (waitFor manager1.register(idCredentials1, UserMessageLimit(20))).isOkOr:
+      assert false, "error returned when calling register: " & error
+
+    let index2 = MembershipIndex(6)
+    let rlnConf2 = getWakuRlnConfig(manager = manager, index = index2)
+    var wakuRlnRelay2: Rln
+    lockNewGlobalBrokerContext:
+      wakuRlnRelay2 = (await Rln.new(rlnConf2)).valueOr:
+        raiseAssert "failed to create waku rln relay: " & $error
+
+    let manager2 = cast[OnchainGroupManager](wakuRlnRelay2.groupManager)
+    let idCredentials2 = generateCredentials()
+
+    (waitFor manager2.register(idCredentials2, UserMessageLimit(20))).isOkOr:
+      assert false, "error returned when calling register: " & error
+
+    # get the current epoch time
+    let epoch = wakuRlnRelay1.getCurrentEpoch()
+
+    #  create messages from different peers and append rln proofs to them
+    var
+      wm1 =
+        WakuMessage(payload: "Valid message from sender 1".toBytes(), timestamp: now())
+      # another message in the same epoch as wm1, it will break the messaging rate limit
+      wm2 =
+        WakuMessage(payload: "Valid message from sender 2".toBytes(), timestamp: now())
+
+    wakuRlnRelay1.unsafeAppendRLNProof(wm1, epoch, MessageId(1)).isOkOr:
+      raiseAssert $error
+    wakuRlnRelay2.unsafeAppendRLNProof(wm2, epoch, MessageId(1)).isOkOr:
+      raiseAssert $error
+
+    let
+      msgValidate1 = await wakuRlnRelay1.validateMessageAndUpdateLog(wm1)
+      msgValidate2 = await wakuRlnRelay1.validateMessageAndUpdateLog(wm2)
+
+    check:
+      msgValidate1 == MessageValidationResult.Valid
+      msgValidate2 == MessageValidationResult.Valid
+
+  test "toIDCommitment and toUInt256":
+    let idCredentialRes = membershipKeyGen()
+    require:
+      idCredentialRes.isOk()
+
+    let idCredential = idCredentialRes.get()
+
+    # convert the idCommitment to UInt256
+    let idCUInt = idCredential.idCommitment.toUInt256()
+    # convert the UInt256 back to ICommitment
+    let idCommitment = toIDCommitment(idCUInt)
+
+    # check that the conversion has not distorted the original value
+    check:
+      idCredential.idCommitment == idCommitment
+
+  test "Read/Write RLN credentials":
+    let idCredentialRes = membershipKeyGen()
+    require:
+      idCredentialRes.isOk()
+
+    let idCredential = idCredentialRes.get()
+    let empty = default(array[32, byte])
+    require:
+      idCredential.idTrapdoor.len == 32
+      idCredential.idNullifier.len == 32
+      idCredential.idSecretHash.len == 32
+      idCredential.idCommitment.len == 32
+      idCredential.idTrapdoor != empty
+      idCredential.idNullifier != empty
+      idCredential.idSecretHash != empty
+      idCredential.idCommitment != empty
+
+    info "the generated identity credential: ", idCredential
+
+    let index = MembershipIndex(1)
+
+    let keystoreMembership = KeystoreMembership(
+      membershipContract: MembershipContract(
+        chainId: "5", address: "0x0123456789012345678901234567890123456789"
+      ),
+      treeIndex: index,
+      identityCredential: idCredential,
+    )
+    let password = "%m0um0ucoW%"
+
+    let filepath = "./testRLNCredentials.txt"
+    defer:
+      removeFile(filepath)
+
+    # Write RLN credentials
+    require:
+      addMembershipCredentials(
+        path = filepath,
+        membership = keystoreMembership,
+        password = password,
+        appInfo = RLNAppInfo,
+      )
+        .isOk()
+
+    let readKeystoreRes = getMembershipCredentials(
+      path = filepath,
+      password = password,
+      # here the query would not include
+      # the identityCredential,
+      # since it is not part of the query
+      # but have used the same value
+      # to avoid re-declaration
+      query = keystoreMembership,
+      appInfo = RLNAppInfo,
+    )
+    assert readKeystoreRes.isOk(), $readKeystoreRes.error
+
+    # getMembershipCredentials returns the credential in the keystore which matches
+    # the query, in this case the query is =
+    # chainId = "5" and
+    # address = "0x0123456789012345678901234567890123456789" and
+    # treeIndex = 1
+    let readKeystoreMembership = readKeystoreRes.get()
+    check:
+      readKeystoreMembership == keystoreMembership
+
+  test "histogram static bucket generation":
+    let buckets = generateBucketsForHistogram(10)
+
+    check:
+      buckets.len == 5
+      buckets == [2.0, 4.0, 6.0, 8.0, 10.0]
+
+  asyncTest "nullifierLog clearing only after epoch has passed":
+    let index = MembershipIndex(0)
+
+    proc runTestForEpochSizeSec(rlnEpochSizeSec: uint) {.async.} =
+      let wakuRlnConfig = getWakuRlnConfig(
+        manager = manager, index = index, epochSizeSec = rlnEpochSizeSec.uint64
+      )
+      var rln: Rln
+      lockNewGlobalBrokerContext:
+        rln = (await Rln.new(wakuRlnConfig)).valueOr:
+          raiseAssert $error
+
+      let rlnMaxEpochGap = rln.rlnMaxEpochGap
+      let testProofMetadata = default(ProofMetadata)
+      let testProofMetadataTable =
+        {testProofMetadata.nullifier: testProofMetadata}.toTable()
+
+      for i in 0 .. rlnMaxEpochGap:
+        # we add epochs to the nullifierLog
+        let testEpoch = rln.calcEpoch(epochTime() + float(rlnEpochSizeSec * i))
+        rln.nullifierLog[testEpoch] = testProofMetadataTable
+        check:
+          rln.nullifierLog.len().uint == i + 1
+
+      check:
+        rln.nullifierLog.len().uint == rlnMaxEpochGap + 1
+
+      # clearing it now will remove 1 epoch
+      rln.clearNullifierLog()
+
+      check:
+        rln.nullifierLog.len().uint == rlnMaxEpochGap
+
+    var testEpochSizes: seq[uint] = @[1, 5, 10, 30, 60, 600]
+    for i in testEpochSizes:
+      await runTestForEpochSizeSec(i)

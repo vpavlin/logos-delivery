@@ -1,0 +1,178 @@
+import
+  results,
+  chronos,
+  libp2p/switch,
+  libp2p/builders,
+  libp2p/nameresolving/nameresolver,
+  libp2p/crypto/crypto as libp2p_keys,
+  eth/keys as eth_keys
+import
+  logos_delivery/waku/[
+    waku_node,
+    net/net_config,
+    waku_core/topics,
+    node/waku_switch,
+    node/peer_manager,
+    waku_enr,
+    discovery/waku_discv5,
+    factory/internal_config,
+    factory/waku_conf,
+    factory/conf_builder/conf_builder,
+    factory/builder,
+    common/logging,
+  ],
+  ./common
+
+# Waku node
+
+# TODO: migrate to usage of a test cluster conf
+proc defaultTestWakuConfBuilder*(): WakuConfBuilder =
+  var builder = WakuConfBuilder.init()
+  builder.withP2pListenAddress(parseIpAddress("0.0.0.0"))
+  builder.restServerConf.withListenAddress(parseIpAddress("127.0.0.1"))
+  builder.withDnsAddrsNameServers(
+    @[parseIpAddress("1.1.1.1"), parseIpAddress("1.0.0.1")]
+  )
+  builder.withNatStrategy("any")
+  builder.withMaxConnections(150)
+  builder.withRelayServiceRatio("50:50")
+  builder.withMaxMessageSize("1024 KiB")
+  builder.withClusterId(DefaultClusterId)
+  builder.withSubscribeShards(@[DefaultShardId])
+  builder.withRelay(true)
+  builder.withRendezvous(true)
+  builder.storeServiceConf.withDbMigration(false)
+  return builder
+
+proc defaultTestWakuConf*(): WakuConf =
+  var builder = defaultTestWakuConfBuilder()
+  return builder.build().value
+
+proc newTestWakuNode*(
+    nodeKey: crypto.PrivateKey,
+    bindIp: IpAddress = parseIpAddress("0.0.0.0"),
+    bindPort: Port = Port(0),
+    extIp = Opt.none(IpAddress),
+    extPort = Opt.none(Port),
+    extMultiAddrs = newSeq[MultiAddress](),
+    peerStorage: PeerStorage = nil,
+    maxConnections = MaxConnections,
+    wsBindPort: Port = (Port) 8000,
+    wsEnabled: bool = false,
+    wssEnabled: bool = false,
+    quicBindPort: Port = (Port) 0,
+    quicEnabled: bool = true,
+    secureKey: string = "",
+    secureCert: string = "",
+    wakuFlags = Opt.none(CapabilitiesBitfield),
+    nameResolver: NameResolver = nil,
+    sendSignedPeerRecord = false,
+    dns4DomainName = Opt.none(string),
+    discv5UdpPort = Opt.none(Port),
+    agentString = Opt.none(string),
+    peerStoreCapacity = Opt.none(int),
+    clusterId = DefaultClusterId,
+    subscribeShards = @[DefaultShardId],
+): WakuNode =
+  logging.setupLog(logging.LogLevel.DEBUG, logging.LogFormat.TEXT)
+
+  # quic won't bind 0.0.0.0 wildcard, use loopback for tests
+  let bindIp =
+    if quicEnabled and $bindIp == "0.0.0.0":
+      parseIpAddress("127.0.0.1")
+    else:
+      bindIp
+
+  # reuse bindPort for quic so the enr addr is dialable; port 0 would advertise /udp/0
+  let quicBindPort =
+    if quicEnabled and quicBindPort == Port(0): bindPort else: quicBindPort
+
+  var resolvedExtIp = extIp
+
+  # Update extPort to default value if it's missing and there's an extIp or a DNS domain
+  let extPort =
+    if (extIp.isSome() or dns4DomainName.isSome()) and extPort.isNone():
+      Opt.some(Port(0))
+    else:
+      extPort
+
+  var conf = defaultTestWakuConf()
+
+  conf.clusterId = clusterId
+  conf.subscribeShards = subscribeShards
+
+  if dns4DomainName.isSome() and extIp.isNone():
+    # If there's an error resolving the IP, an exception is thrown and test fails
+    let dns = (waitFor dnsResolve(dns4DomainName.get(), conf.dnsAddrsNameServers)).valueOr:
+      raise newException(Defect, error)
+
+    resolvedExtIp = Opt.some(parseIpAddress(dns))
+
+  let netConf = NetConfig.init(
+    clusterId = conf.clusterId,
+    bindIp = bindIp,
+    bindPort = bindPort,
+    extIp = resolvedExtIp,
+    extPort = extPort,
+    extMultiAddrs = extMultiAddrs,
+    wsBindPort = Opt.some(wsBindPort),
+    wsEnabled = wsEnabled,
+    wssEnabled = wssEnabled,
+    quicBindPort = Opt.some(quicBindPort),
+    quicEnabled = quicEnabled,
+    dns4DomainName = dns4DomainName,
+    discv5UdpPort = discv5UdpPort,
+    wakuFlags = wakuFlags,
+  ).valueOr:
+    raise newException(Defect, "Invalid network configuration: " & error)
+
+  var enrBuilder = EnrBuilder.init(nodeKey)
+
+  enrBuilder.withWakuRelaySharding(
+    RelayShards(clusterId: conf.clusterId, shardIds: conf.subscribeShards)
+  ).isOkOr:
+    raise newException(Defect, "Invalid record: " & $error)
+
+  enrBuilder.withIpAddressAndPorts(
+    ipAddr = netConf.enrIp, tcpPort = netConf.enrPort, udpPort = netConf.discv5UdpPort
+  )
+
+  enrBuilder.withMultiaddrs(netConf.enrMultiaddrs)
+
+  if netConf.wakuFlags.isSome():
+    enrBuilder.withWakuCapabilities(netConf.wakuFlags.get())
+
+  let record = enrBuilder.build().valueOr:
+    raise newException(Defect, "Invalid record: " & $error)
+
+  var builder = WakuNodeBuilder.init()
+  builder.withRng(rng())
+  builder.withNodeKey(nodeKey)
+  builder.withRecord(record)
+  builder.withNetworkConfiguration(netConf)
+  builder.withPeerStorage(peerStorage, capacity = peerStoreCapacity)
+  builder.withSwitchConfiguration(
+    maxConnections = Opt.some(maxConnections),
+    nameResolver = nameResolver,
+    sendSignedPeerRecord = sendSignedPeerRecord,
+    secureKey =
+      if secureKey != "":
+        Opt.some(secureKey)
+      else:
+        Opt.none(string),
+    secureCert =
+      if secureCert != "":
+        Opt.some(secureCert)
+      else:
+        Opt.none(string),
+    agentString = agentString,
+  )
+
+  return builder.build().get()
+
+proc boundTcpPort*(node: WakuNode): Port =
+  let ports = getPorts(node.switch.peerInfo.listenAddrs).valueOr:
+    raiseAssert "getPorts failed: " & error
+  if ports.tcpPort.isNone():
+    raiseAssert "no tcp listen address in " & $node.switch.peerInfo.listenAddrs
+  ports.tcpPort.get()

@@ -1,0 +1,349 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <getopt.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <pthread.h>
+
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+#include "base64.h"
+#include "../../library/liblogosdelivery_kernel.h"
+
+// Shared synchronization variables
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+int callback_executed = 0;
+
+void waitForCallback()
+{
+  pthread_mutex_lock(&mutex);
+  while (!callback_executed)
+  {
+    pthread_cond_wait(&cond, &mutex);
+  }
+  callback_executed = 0;
+  pthread_mutex_unlock(&mutex);
+}
+
+#define WAKU_CALL(call)                                                  \
+  do                                                                     \
+  {                                                                      \
+    int ret = call;                                                      \
+    if (ret != 0)                                                        \
+    {                                                                    \
+      printf("Failed the call to: %s. Returned code: %d\n", #call, ret); \
+      exit(1);                                                           \
+    }                                                                    \
+    waitForCallback();                                                   \
+  } while (0)
+
+struct ConfigNode
+{
+  char host[128];
+  int port;
+  char key[128];
+  int relay;
+  char peers[2048];
+  int store;
+};
+
+// libwaku Context
+void *ctx;
+
+// For the case of C language we don't need to store a particular userData
+void *userData = NULL;
+
+// Arguments parsing. Uses POSIX getopt so the example builds on glibc and on
+// macOS/BSD alike (argp is a GNU libc extension not available everywhere).
+static void parse_args(int argc, char **argv, struct ConfigNode *cfgNode)
+{
+  int opt;
+  while ((opt = getopt(argc, argv, "h:p:k:r:a:")) != -1)
+  {
+    switch (opt)
+    {
+    case 'h':
+      snprintf(cfgNode->host, 128, "%s", optarg);
+      break;
+    case 'p':
+      cfgNode->port = atoi(optarg);
+      break;
+    case 'k':
+      snprintf(cfgNode->key, 128, "%s", optarg);
+      break;
+    case 'r':
+      cfgNode->relay = atoi(optarg);
+      break;
+    case 'a':
+      snprintf(cfgNode->peers, 2048, "%s", optarg);
+      break;
+    default:
+      printf("Wrong parameters\n");
+      exit(1);
+    }
+  }
+}
+
+void signal_cond()
+{
+  pthread_mutex_lock(&mutex);
+  callback_executed = 1;
+  pthread_cond_signal(&cond);
+  pthread_mutex_unlock(&mutex);
+}
+
+void event_handler(int callerRet, const char *msg, size_t len, void *userData)
+{
+  if (callerRet == RET_ERR)
+  {
+    printf("Error: %s\n", msg);
+    exit(1);
+  }
+  else if (callerRet == RET_OK)
+  {
+    printf("Receiving event: %s\n", msg);
+  }
+
+  signal_cond();
+}
+
+void on_event_received(int callerRet, const char *msg, size_t len, void *userData)
+{
+  if (callerRet == RET_ERR)
+  {
+    printf("Error: %s\n", msg);
+    exit(1);
+  }
+  else if (callerRet == RET_OK)
+  {
+    printf("Receiving event: %s\n", msg);
+  }
+}
+
+char *contentTopic = NULL;
+void handle_content_topic(int callerRet, const char *msg, size_t len, void *userData)
+{
+  if (contentTopic != NULL)
+  {
+    free(contentTopic);
+  }
+
+  contentTopic = malloc(len * sizeof(char) + 1);
+  strcpy(contentTopic, msg);
+  signal_cond();
+}
+
+char *publishResponse = NULL;
+void handle_publish_ok(int callerRet, const char *msg, size_t len, void *userData)
+{
+  printf("Publish Ok: %s %lu\n", msg, len);
+
+  if (publishResponse != NULL)
+  {
+    free(publishResponse);
+  }
+
+  publishResponse = malloc(len * sizeof(char) + 1);
+  strcpy(publishResponse, msg);
+}
+
+#define MAX_MSG_SIZE 65535
+
+void publish_message(const char *msg)
+{
+  char jsonWakuMsg[MAX_MSG_SIZE];
+  char *msgPayload = b64_encode(msg, strlen(msg));
+
+  WAKU_CALL(waku_content_topic(ctx,
+                               handle_content_topic,
+                               userData,
+                               "appName",
+                               1,
+                               "contentTopicName",
+                               "encoding"));
+  snprintf(jsonWakuMsg,
+           MAX_MSG_SIZE,
+           "{\"payload\":\"%s\",\"contentTopic\":\"%s\"}",
+           msgPayload, contentTopic);
+
+  free(msgPayload);
+
+  WAKU_CALL(waku_relay_publish(ctx,
+                               event_handler,
+                               userData,
+                               "/waku/2/rs/16/32",
+                               jsonWakuMsg,
+                               10000 /*timeout ms*/));
+}
+
+void show_help_and_exit()
+{
+  printf("Wrong parameters\n");
+  exit(1);
+}
+
+void print_default_pubsub_topic(int callerRet, const char *msg, size_t len, void *userData)
+{
+  printf("Default pubsub topic: %s\n", msg);
+  signal_cond();
+}
+
+void print_waku_version(int callerRet, const char *msg, size_t len, void *userData)
+{
+  printf("Git Version: %s\n", msg);
+  signal_cond();
+}
+
+// Beginning of UI program logic
+
+enum PROGRAM_STATE
+{
+  MAIN_MENU,
+  SUBSCRIBE_TOPIC_MENU,
+  CONNECT_TO_OTHER_NODE_MENU,
+  PUBLISH_MESSAGE_MENU
+};
+
+enum PROGRAM_STATE current_state = MAIN_MENU;
+
+void show_main_menu()
+{
+  printf("\nPlease, select an option:\n");
+  printf("\t1.) Subscribe to topic\n");
+  printf("\t2.) Connect to other node\n");
+  printf("\t3.) Publish a message\n");
+}
+
+void handle_user_input()
+{
+  char cmd[1024];
+  memset(cmd, 0, 1024);
+  int numRead = read(0, cmd, 1024);
+  if (numRead <= 0)
+  {
+    return;
+  }
+
+  switch (atoi(cmd))
+  {
+  case SUBSCRIBE_TOPIC_MENU:
+  {
+    printf("Indicate the Pubsubtopic to subscribe:\n");
+    char pubsubTopic[128];
+    scanf("%127s", pubsubTopic);
+
+    WAKU_CALL(waku_relay_subscribe(ctx,
+                                   event_handler,
+                                   userData,
+                                   pubsubTopic));
+    printf("The subscription went well\n");
+
+    show_main_menu();
+  }
+  break;
+
+  case CONNECT_TO_OTHER_NODE_MENU:
+    // printf("Connecting to a node. Please indicate the peer Multiaddress:\n");
+    // printf("e.g.: /ip4/127.0.0.1/tcp/60001/p2p/16Uiu2HAmVFXtAfSj4EiR7mL2KvL4EE2wztuQgUSBoj2Jx2KeXFLN\n");
+    // char peerAddr[512];
+    // scanf("%511s", peerAddr);
+    // WAKU_CALL(waku_connect(ctx, peerAddr, 10000 /* timeoutMs */, event_handler, userData));
+    show_main_menu();
+    break;
+
+  case PUBLISH_MESSAGE_MENU:
+  {
+    printf("Type the message to publish:\n");
+    char msg[1024];
+    scanf("%1023s", msg);
+
+    publish_message(msg);
+
+    show_main_menu();
+  }
+  break;
+
+  case MAIN_MENU:
+    break;
+  }
+}
+
+// End of UI program logic
+
+int main(int argc, char **argv)
+{
+  struct ConfigNode cfgNode;
+  // default values
+  snprintf(cfgNode.host, 128, "0.0.0.0");
+  cfgNode.port = 60000;
+  cfgNode.relay = 1;
+
+  cfgNode.store = 0;
+
+  parse_args(argc, argv, &cfgNode);
+
+  char jsonConfig[5000];
+  snprintf(jsonConfig, 5000, "{ \
+                                    \"mode\": \"Core\", \
+                                    \"preset\": \"status.prod\", \
+                                    \"messagingOverrides\": { \
+                                        \"listen-address\": \"%s\",    \
+                                        \"tcp-port\": %d,        \
+                                        \"store\": %s,       \
+                                        \"log-level\": \"DEBUG\", \
+                                        \"discv5-udp-port\": 9999 \
+                                    } \
+                                }",
+           cfgNode.host,
+           cfgNode.port,
+           cfgNode.store ? "true" : "false");
+
+  ctx = logosdelivery_create_node(jsonConfig, event_handler, userData);
+  waitForCallback();
+
+  WAKU_CALL(waku_default_pubsub_topic(ctx, print_default_pubsub_topic, userData));
+  WAKU_CALL(waku_version(ctx, print_waku_version, userData));
+
+  printf("Bind addr: %s:%u\n", cfgNode.host, cfgNode.port);
+  printf("Waku Relay enabled: %s\n", cfgNode.relay == 1 ? "YES" : "NO");
+
+  logosdelivery_set_event_callback(ctx, on_event_received, userData);
+
+  logosdelivery_start_node(ctx, event_handler, userData);
+  waitForCallback();
+
+  WAKU_CALL(waku_listen_addresses(ctx, event_handler, userData));
+
+  WAKU_CALL(waku_relay_subscribe(ctx,
+                                 event_handler,
+                                 userData,
+                                "/waku/2/rs/16/32"));
+
+  WAKU_CALL(waku_discv5_update_bootnodes(ctx,
+                                         event_handler,
+                                         userData,
+                                         "[\"enr:-QEkuEBIkb8q8_mrorHndoXH9t5N6ZfD-jehQCrYeoJDPHqT0l0wyaONa2-piRQsi3oVKAzDShDVeoQhy0uwN1xbZfPZAYJpZIJ2NIJpcIQiQlleim11bHRpYWRkcnO4bgA0Ni9ub2RlLTAxLmdjLXVzLWNlbnRyYWwxLWEud2FrdS5zYW5kYm94LnN0YXR1cy5pbQZ2XwA2Ni9ub2RlLTAxLmdjLXVzLWNlbnRyYWwxLWEud2FrdS5zYW5kYm94LnN0YXR1cy5pbQYfQN4DgnJzkwABCAAAAAEAAgADAAQABQAGAAeJc2VjcDI1NmsxoQKnGt-GSgqPSf3IAPM7bFgTlpczpMZZLF3geeoNNsxzSoN0Y3CCdl-DdWRwgiMohXdha3UyDw\",\"enr:-QEkuEB3WHNS-xA3RDpfu9A2Qycr3bN3u7VoArMEiDIFZJ66F1EB3d4wxZN1hcdcOX-RfuXB-MQauhJGQbpz3qUofOtLAYJpZIJ2NIJpcIQI2SVcim11bHRpYWRkcnO4bgA0Ni9ub2RlLTAxLmFjLWNuLWhvbmdrb25nLWMud2FrdS5zYW5kYm94LnN0YXR1cy5pbQZ2XwA2Ni9ub2RlLTAxLmFjLWNuLWhvbmdrb25nLWMud2FrdS5zYW5kYm94LnN0YXR1cy5pbQYfQN4DgnJzkwABCAAAAAEAAgADAAQABQAGAAeJc2VjcDI1NmsxoQPK35Nnz0cWUtSAhBp7zvHEhyU_AqeQUlqzLiLxfP2L4oN0Y3CCdl-DdWRwgiMohXdha3UyDw\"]"));
+
+  WAKU_CALL(waku_get_peerids_from_peerstore(ctx,
+                                            event_handler,
+                                            userData));
+
+  show_main_menu();
+  while (1)
+  {
+    handle_user_input();
+
+    // Uncomment the following if need to test the metrics retrieval
+    // WAKU_CALL( waku_get_metrics(ctx,
+    //                           event_handler,
+    //                           userData) );
+  }
+
+  pthread_mutex_destroy(&mutex);
+  pthread_cond_destroy(&cond);
+}

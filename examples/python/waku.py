@@ -1,0 +1,164 @@
+import ctypes
+import argparse
+import sys
+
+if sys.platform == "darwin":
+    _lib_ext = "dylib"
+elif sys.platform == "win32":
+    _lib_ext = "dll"
+else:
+    _lib_ext = "so"
+
+_lib_path = f"build/liblogosdelivery.{_lib_ext}"
+
+libwaku = object
+try:
+    # This python script should be run from the root repo folder
+    libwaku = ctypes.CDLL(_lib_path)
+except OSError as e:
+    print(f"Exception: {e}")
+    print(f"""
+The '{_lib_path}' library can be created with the next command from
+the repo's root folder: `make liblogosdelivery`.
+
+And it should build the library in '{_lib_path}'.
+
+Therefore, make sure the library path env var points at the location that
+contains the '{_lib_path}' library.
+""")
+    exit(1)
+
+def handle_event(ret, msg, user_data):
+    print("Event received: %s" % msg)
+
+def call_waku(func):
+    ret = func()
+    if (ret != 0):
+        print("Error in %s. Error code: %d" % (locals().keys(), ret))
+        exit(1)
+
+# Parse params
+parser = argparse.ArgumentParser(description='libwaku integration in Python.')
+parser.add_argument('-d', '--host', dest='host', default='0.0.0.0',
+                    help='Address this node will listen to. [=0.0.0.0]')
+parser.add_argument('-p', '--port', dest='port', default=60000, required=True,
+                    help='Port this node will listen to. [=60000]')
+parser.add_argument('-k', '--key', dest='key', default="", required=True,
+                    help="""P2P node private key as 64 char hex string.
+e.g.: 364d111d729a6eb6d2e6113e163f017b5ef03a6f94c9b5b7bb1bb36fa5cb07a9""")
+parser.add_argument('-r', '--relay', dest='relay', default="true",
+                    help="Enable relay protocol: true|false [=true]")
+parser.add_argument('--peer', dest='peer', default="",
+                    help="Multiqualified libp2p address")
+
+args = parser.parse_args()
+
+# The next 'json_config' is the item passed to the 'logosdelivery_create_node'.
+json_config = "{ \
+                \"mode\": \"Core\", \
+                \"messagingOverrides\": { \
+                    \"listen-address\": \"%s\", \
+                    \"tcp-port\": %d,           \
+                    \"nodekey\": \"%s\",        \
+                    \"log-level\": \"DEBUG\"    \
+                } \
+            }" % (args.host,
+                  int(args.port),
+                  args.key)
+
+callback_type = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t)
+
+# Node creation
+libwaku.logosdelivery_create_node.restype = ctypes.c_void_p
+libwaku.logosdelivery_create_node.argtypes = [ctypes.c_char_p,
+                             callback_type,
+                             ctypes.c_void_p]
+
+ctx = libwaku.logosdelivery_create_node(bytes(json_config, 'utf-8'),
+                       callback_type(
+                           #onErrCb
+                           lambda ret, msg, len:
+                             print("Error calling logosdelivery_create_node: %s",
+                                   msg.decode('utf-8'))
+                           ),
+                           ctypes.c_void_p(0))
+
+# Retrieve the current version of the library
+libwaku.waku_version.argtypes = [ctypes.c_void_p,
+                                 callback_type,
+                                 ctypes.c_void_p]
+libwaku.waku_version(ctx,
+                     callback_type(lambda ret, msg, len:
+                                  print("Git Version: %s" %
+                                        msg.decode('utf-8'))),
+                     ctypes.c_void_p(0))
+
+# Retrieve the default pubsub topic
+default_pubsub_topic = ""
+libwaku.waku_default_pubsub_topic.argtypes = [ctypes.c_void_p,
+                                 callback_type,
+                                 ctypes.c_void_p]
+libwaku.waku_default_pubsub_topic(ctx,
+                                  callback_type(
+                                        lambda ret, msg, len: (
+                                            globals().update(default_pubsub_topic = msg.decode('utf-8')),
+                                            print("Default pubsub topic: %s" % msg.decode('utf-8')))
+                                  ),
+                                  ctypes.c_void_p(0))
+
+print("Bind addr: {}:{}".format(args.host, args.port))
+print("Waku Relay enabled: {}".format(args.relay))
+
+# Set the event callback
+callback = callback_type(handle_event) # This line is important so that the callback is not gc'ed
+
+libwaku.logosdelivery_set_event_callback.argtypes = [callback_type, ctypes.c_void_p]
+libwaku.logosdelivery_set_event_callback(callback, ctypes.c_void_p(0))
+
+# Start the node
+libwaku.logosdelivery_start_node.argtypes = [ctypes.c_void_p,
+                               callback_type,
+                               ctypes.c_void_p]
+libwaku.logosdelivery_start_node(ctx,
+                   callback_type(lambda ret, msg, len:
+                                  print("Error in logosdelivery_start_node: %s" %
+                                        msg.decode('utf-8'))),
+                   ctypes.c_void_p(0))
+
+# Subscribe to the default pubsub topic
+libwaku.waku_relay_subscribe.argtypes = [ctypes.c_void_p,
+                                         callback_type,
+                                         ctypes.c_void_p,
+                                         ctypes.c_char_p]
+libwaku.waku_relay_subscribe(ctx,
+                             callback_type(
+                                    #onErrCb
+                                    lambda ret, msg, len:
+                                        print("Error calling waku_relay_subscribe: %s" %
+                                                msg.decode('utf-8'))
+                             ),
+                             ctypes.c_void_p(0),
+                             default_pubsub_topic.encode('utf-8'))
+
+libwaku.waku_connect.argtypes = [ctypes.c_void_p,
+                                 callback_type,
+                                 ctypes.c_void_p,
+                                 ctypes.c_char_p,
+                                 ctypes.c_int]
+libwaku.waku_connect(ctx,
+                     # onErrCb
+                     callback_type(
+                         lambda ret, msg, len:
+                           print("Error calling waku_connect: %s" % msg.decode('utf-8'))),
+                     ctypes.c_void_p(0),
+                     args.peer.encode('utf-8'),
+                     10000)
+
+# app = Flask(__name__)
+# @app.route("/")
+# def hello_world():
+#     return "Hello, World!"
+
+# Simply avoid the app to
+a = input()
+
