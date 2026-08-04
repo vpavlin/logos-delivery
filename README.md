@@ -1,5 +1,13 @@
 # Logos Messaging Nim
 
+> **Fork notice.** This is a KYM fork of
+> [logos-messaging/logos-delivery](https://github.com/logos-messaging/logos-delivery) at commit
+> **`8ad99f10`** (the `feat`/string-ABI branch with the **Reliable Channels** API). It carries a
+> small set of build patches enabling a working **arm64-Android** `liblogosdelivery.so`, plus the
+> empirical build recipe and a description of how KYM uses Reliable Channels — see
+> [`WRITEUP.md`](./WRITEUP.md). Upstream's dual MIT/Apache-2.0 licensing
+> (`LICENSE-MIT`, `LICENSE-APACHE`) is preserved unchanged.
+
 ## Introduction
 
 This repository implements a set of libp2p protocols aimed to bring
