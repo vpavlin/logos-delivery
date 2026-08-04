@@ -2,3 +2,4 @@ build/
 nimbledeps/
 nimcache/
 nimble.paths
+nimble.develop
