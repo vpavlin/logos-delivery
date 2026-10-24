@@ -16,6 +16,13 @@ set -e
 
 export RUSTFLAGS="-Ccodegen-units=1"
 
+# PATCH: allow a pre-built librln.so (e.g. built without Docker:
+# cargo rustc --release --lib --target=<arch> --crate-type=cdylib with the NDK linker).
+if [[ -f "${nwaku_build_dir}/android/${abi}/librln.so" ]]; then
+  echo "Using pre-built ${nwaku_build_dir}/android/${abi}/librln.so"
+  exit 0
+fi
+
 # cross compiles the Rust lib inside Docker images that bundle their own
 # Android toolchain; pinned so upstream changes cannot break this build.
 if ! command -v cross >/dev/null 2>&1; then
