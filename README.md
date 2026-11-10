@@ -1,5 +1,16 @@
 # Logos Messaging Nim
 
+> **Fork notice (branch `loam/android-v0.38.1`).** The source of the arm64-Android
+> `liblogosdelivery.so` that the [Loam app](https://github.com/vpavlin/loam/tree/master/app/native/logosdelivery)
+> ships: [logos-messaging/logos-delivery](https://github.com/logos-messaging/logos-delivery) at
+> **`8ad99f10`** (v0.38.1, Reliable Channels API) plus these commits:
+> - android: assume online when no peers are connected (the DNS connectivity check deadlocks on Android);
+> - android: link `libc++_shared`;
+> - sds: memory-only persistence, and deliver content despite missing causal deps (app-tuned, see the commit);
+> - flake: use nixpkgs nimble.
+>
+> Build recipe and notes: [`WRITEUP.md`](./WRITEUP.md). Licensing (MIT / Apache-2.0) unchanged.
+
 ## Introduction
 
 This repository implements a set of libp2p protocols aimed to bring
