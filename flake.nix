@@ -64,7 +64,7 @@
 
       pkgsFor = system: import nixpkgs {
         inherit system;
-        overlays = [ (import rust-overlay) nimbleOverlay ];
+        overlays = [ (import rust-overlay) ];  # dropped custom nimble 0.22.3 (broken sat dep); use nixpkgs nimble
       };
     in {
       packages = forAllSystems (system:
