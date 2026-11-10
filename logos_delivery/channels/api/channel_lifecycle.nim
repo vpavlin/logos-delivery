@@ -16,6 +16,7 @@ const SdsJobId = "sds"
   ## keyed by channelId.
 
 proc sdsPersistence(): Opt[Persistence] =
+  return Opt.none(Persistence)  # PATCH(KYM): force memory-only (dodge openJob nil SIGSEGV)
   ## SDS backend from the Persistency singleton; memory-only fallback when
   ## it is unavailable (e.g. unit tests).
   let p = Persistency.instance().valueOr:

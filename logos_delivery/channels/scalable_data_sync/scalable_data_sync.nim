@@ -216,7 +216,12 @@ proc handleIncoming*(
         warn "SDS pending-content stash full, dropping oldest entry",
           channelId = self.channelId, dropped = oldest
       self.pendingContent[msg.messageId] = unwrapped.message
-      res = ok(newSeq[seq[byte]]())
+      # PATCH(KYM): deliver despite missing causal deps — KYM's CRDT tolerates
+      # out-of-order (HLC + dedup by id); SDS strict ordering deadlocks a fresh join.
+      if unwrapped.message.len > 0:
+        res = ok(@[unwrapped.message])
+      else:
+        res = ok(newSeq[seq[byte]]())
       break ingress
 
     var deliverable = newSeq[seq[byte]]()
