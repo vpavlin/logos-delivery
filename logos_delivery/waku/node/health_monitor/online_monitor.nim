@@ -43,7 +43,13 @@ proc updateOnlineState(self: OnlineMonitor) {.async.} =
     if numConnectedPeers > 0:
       true
     else:
-      await checkInternetConnectivity(self.dnsNameServers)
+      # PATCH (mobile/Android): nim's DnsResolver (raw UDP to 1.1.1.1) fails on Android's
+      # sandboxed network stack, so the DNS-based connectivity check always returns false and
+      # DEADLOCKS the node offline — it won't dial bootstrap peers, so it never gets peers, so it
+      # stays offline forever. Assume online so the node dials the fleet and forms the relay mesh;
+      # once connected, numConnectedPeers>0 keeps it online for real. (Desktop is unaffected: DNS
+      # resolves fine there, so this branch is rarely hit.)
+      true
 
   for onlineStateObserver in self.onlineStateObservers:
     onlineStateObserver(self.online)
